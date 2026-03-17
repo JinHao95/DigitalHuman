@@ -1,0 +1,17 @@
+# 核心依赖
+faster-whisper          # ASR（无 numba 依赖，Apple Silicon 友好）
+webrtcvad-wheels        # VAD（预编译，macOS 兼容）
+sounddevice             # 音频采集 / 播放
+"numpy<2"               # numpy 1.x（兼容 torch 2.2）
+scipy
+openai>=1.0.0
+
+# ChatTTS（主 TTS）
+chattts
+
+# 备用 TTS
+edge-tts
+soundfile
+
+# PyTorch（先手动安装，见 README）
+# pip install torch torchaudio
