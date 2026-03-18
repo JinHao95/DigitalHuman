@@ -4,7 +4,7 @@ tts.py
 输入：文本字符串
 输出：numpy float32 音频数组（24kHz）
 
-ChatTTS 安装：pip install chattts
+ChatTTS 安装：pip install chattts==0.2.4
 项目主页：https://github.com/2noise/ChatTTS
 """
 
@@ -22,17 +22,12 @@ TOP_P         = float(os.getenv("CHATTTS_TOP_P",         "0.7"))
 TOP_K         = int(os.getenv("CHATTTS_TOP_K",           "20"))
 SPEED         = int(os.getenv("CHATTTS_SPEED",           "5"))    # 1~10
 
-# 是否使用 oral（口语化）/ laugh（笑声）/ break（停顿）增强
-USE_ORAL    = int(os.getenv("CHATTTS_ORAL",    "2"))   # 0~9
-USE_LAUGH   = int(os.getenv("CHATTTS_LAUGH",   "0"))   # 0~2
-USE_BREAK   = int(os.getenv("CHATTTS_BREAK",   "6"))   # 0~7
-
 CHATTTS_SAMPLE_RATE = 24000   # ChatTTS 输出采样率固定为 24kHz
 
 
 class TTSEngine:
     """
-    ChatTTS TTS 封装。
+    ChatTTS TTS 封装（兼容 0.2.x API）。
 
     用法：
         tts = TTSEngine()
@@ -44,15 +39,18 @@ class TTSEngine:
         try:
             import ChatTTS
             self.chat = ChatTTS.Chat()
-            self.chat.load(compile=False)   # compile=True 可提速但首次耗时
+            # 始终使用 tts.py 所在目录作为 custom_path，
+            # ChatTTS 会在该目录下查找 asset/ 子目录，
+            # 避免从不同工作目录启动时重复下载模型
+            _base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.chat.load(source="local", custom_path=_base_dir, compile=False)
             print("[TTS] ChatTTS 加载完成。")
         except ImportError:
             raise ImportError(
-                "ChatTTS 未安装，请执行：pip install chattts\n"
+                "ChatTTS 未安装，请执行：pip install chattts==0.2.4\n"
                 "或访问 https://github.com/2noise/ChatTTS"
             )
 
-        # 固定音色
         self._spk = self._make_speaker(speaker_seed)
         self.sample_rate = CHATTTS_SAMPLE_RATE
 
@@ -61,50 +59,36 @@ class TTSEngine:
     def synthesize(self, text: str) -> np.ndarray:
         """
         将文本合成为音频。
-
-        参数：
-            text: 要合成的文本
-        返回：
-            float32 numpy array，采样率 24000 Hz，范围 [-1, 1]
-            失败时返回空数组
+        返回：float32 numpy array，采样率 24000 Hz，范围 [-1, 1]
         """
         if not text or not text.strip():
             return np.zeros(1, dtype=np.float32)
 
-        # 清理不适合 TTS 的字符
         clean_text = self._clean_text(text)
         if not clean_text:
             return np.zeros(1, dtype=np.float32)
 
-        # 构建 infer_code 参数（控制语速、情感）
+        # ChatTTS 0.2.x：InferCodeParams 用 prompt 控制语速，不再单独有 speed 参数
         params_infer = self.chat.InferCodeParams(
             spk_emb=self._spk,
             temperature=TEMPERATURE,
             top_P=TOP_P,
             top_K=TOP_K,
-            manual_seed=None,
-        )
-
-        # 构建 refine_text 参数（口语化增强）
-        params_refine = self.chat.RefineTextParams(
-            prompt=f"[oral_{USE_ORAL}][laugh_{USE_LAUGH}][break_{USE_BREAK}]",
-            top_P=TOP_P,
-            top_K=TOP_K,
-            temperature=TEMPERATURE,
+            prompt=f"[speed_{SPEED}]",
         )
 
         try:
-            wavs = self.chat.infer(
-                texts=[clean_text],
-                params_refine_text=params_refine,
+            # 0.2.x：infer(text=...) 接受单字符串，skip_refine_text=True 跳过 refine 阶段
+            # （refine 阶段在当前版本有兼容 bug，跳过后直接合成效果已足够自然）
+            result = self.chat.infer(
+                text=clean_text,
                 params_infer_code=params_infer,
                 use_decoder=True,
-                skip_refine_text=False,
+                skip_refine_text=True,
             )
 
-            if wavs and len(wavs) > 0 and wavs[0] is not None:
-                audio = np.array(wavs[0], dtype=np.float32)
-                # 归一化（防止爆音）
+            if result is not None and len(result) > 0 and result[0] is not None:
+                audio = np.array(result[0], dtype=np.float32)
                 peak = np.abs(audio).max()
                 if peak > 0:
                     audio = audio / peak * 0.9
@@ -133,22 +117,24 @@ class TTSEngine:
     @staticmethod
     def _clean_text(text: str) -> str:
         """移除 Markdown、emoji、特殊符号等不适合朗读的内容。"""
-        # 去掉 emoji 及所有 Unicode 符号类字符（Emoji、杂项符号、箭头等）
-        text = re.sub(r"[\U00010000-\U0010ffff]", "", text)   # 辅助平面（大部分 emoji）
-        text = re.sub(r"[\u2600-\u27BF]", "", text)            # 杂项符号、箭头、Dingbats
-        text = re.sub(r"[\u2300-\u23FF]", "", text)            # 技术符号
-        text = re.sub(r"[\uFE00-\uFE0F]", "", text)            # 变体选择符
+        # 去掉 emoji 及 Unicode 符号类字符
+        text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
+        text = re.sub(r"[\u2600-\u27BF]", "", text)
+        text = re.sub(r"[\u2300-\u23FF]", "", text)
+        text = re.sub(r"[\uFE00-\uFE0F]", "", text)
         # 去掉 Markdown 标记
         text = re.sub(r"\*+", "", text)
         text = re.sub(r"#+\s*", "", text)
         text = re.sub(r"`+", "", text)
-        text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)  # [text](url) → text
+        text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+        # 全角标点转半角（ChatTTS 对全角感叹号等有警告）
+        text = text.replace("！", "!").replace("？", "?").replace("，", ",").replace("。", ".")
         # 去掉多余空白
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
 
-# ─────────────────────────── 备用 TTS（edge-tts / pyttsx3）───────────────────────────
+# ─────────────────────────── 备用 TTS（edge-tts）───────────────────────────
 class FallbackTTSEngine:
     """
     当 ChatTTS 不可用时的备用方案：使用 edge-tts（微软在线 TTS）。
@@ -190,7 +176,6 @@ class FallbackTTSEngine:
             audio, sr = sf.read(buf, dtype="float32")
             if audio.ndim > 1:
                 audio = audio[:, 0]
-            # 如果采样率不同，简单重采样
             if sr != self.SAMPLE_RATE:
                 from scipy.signal import resample_poly
                 from math import gcd
@@ -203,9 +188,7 @@ class FallbackTTSEngine:
 
 
 def create_tts_engine() -> TTSEngine | FallbackTTSEngine:
-    """
-    工厂函数：优先使用 ChatTTS，不可用则自动降级到 edge-tts。
-    """
+    """工厂函数：优先使用 ChatTTS，不可用则自动降级到 edge-tts。"""
     try:
         return TTSEngine()
     except Exception as e:
@@ -217,7 +200,7 @@ def create_tts_engine() -> TTSEngine | FallbackTTSEngine:
 if __name__ == "__main__":
     import scipy.io.wavfile as wav
     tts = create_tts_engine()
-    text = "你好，我是你的语音助手，很高兴认识你！"
+    text = "你好,我是你的语音助手,很高兴认识你."
     print(f"[TTS] 合成文本: {text}")
     audio = tts.synthesize(text)
     print(f"[TTS] 音频长度: {len(audio)/tts.sample_rate:.2f} 秒")

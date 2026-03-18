@@ -28,5 +28,6 @@ test_mic_light.py
 .vscode/
 .idea/
 
-# Claude Code
-.claude/
+# ChatTTS 模型文件（体积大，不入库）
+asset/
+chattts_test.wav
