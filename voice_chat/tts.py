@@ -14,7 +14,7 @@ import numpy as np
 
 # ─────────────────────────── 配置 ───────────────────────────
 # 音色种子（固定种子 = 固定音色，设为 None 则随机）
-SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "2222"))
+SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "4000"))
 
 # 推理参数
 TEMPERATURE   = float(os.getenv("CHATTTS_TEMPERATURE",   "0.3"))
@@ -69,8 +69,9 @@ class TTSEngine:
             return np.zeros(1, dtype=np.float32)
 
         # ChatTTS 0.2.x：InferCodeParams 用 prompt 控制语速
-        # max_new_token 按文字长度动态设定，每字约 15 token，避免跑满 2048 导致超时
-        max_tokens = max(200, len(clean_text) * 15)
+        # max_new_token 按文字长度动态设定，每字约 12 token，下限 80
+        # 避免 max_new_token 过大导致模型空跑浪费时间
+        max_tokens = max(80, len(clean_text) * 12)
         params_infer = self.chat.InferCodeParams(
             spk_emb=self._spk,
             temperature=TEMPERATURE,
@@ -119,7 +120,18 @@ class TTSEngine:
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        """移除 Markdown、emoji、特殊符号等不适合朗读的内容。"""
+        """移除 Markdown、emoji、特殊符号等不适合朗读的内容，保留 ChatTTS 韵律标签。"""
+        # 先把 ChatTTS 标签占位保存，避免后续正则误伤
+        # 支持的标签：[uv_break] [lbreak] [laugh] [oral_N] [speed_N]
+        _TAG_RE = re.compile(r'\[(uv_break|lbreak|laugh|oral_\d|speed_\d+)\]')
+        tags = _TAG_RE.findall(text)
+        # 用占位符替换标签（ASCII 不会被后续正则删掉）
+        placeholder_map = {}
+        for i, tag in enumerate(tags):
+            ph = f"\x00TAG{i}\x00"
+            placeholder_map[ph] = f"[{tag}]"
+            text = text.replace(f"[{tag}]", ph, 1)
+
         # 去掉 emoji 及 Unicode 符号类字符
         text = re.sub(r"[\U00010000-\U0010ffff]", "", text)
         text = re.sub(r"[\u2600-\u27BF]", "", text)
@@ -135,6 +147,10 @@ class TTSEngine:
         text = text.replace("～", "").replace("~", "").replace("…", "...")
         # 去掉多余空白
         text = re.sub(r"\s+", " ", text).strip()
+
+        # 还原 ChatTTS 标签
+        for ph, tag in placeholder_map.items():
+            text = text.replace(ph, tag)
         return text
 
 
@@ -202,12 +218,26 @@ def create_tts_engine() -> TTSEngine | FallbackTTSEngine:
 
 # ─────────────────────────── 独立测试 ───────────────────────────
 if __name__ == "__main__":
+    import subprocess
     import scipy.io.wavfile as wav
     tts = create_tts_engine()
-    text = "你好,我是你的语音助手,很高兴认识你."
-    print(f"[TTS] 合成文本: {text}")
-    audio = tts.synthesize(text)
-    print(f"[TTS] 音频长度: {len(audio)/tts.sample_rate:.2f} 秒")
-    out_path = "tts_test.wav"
-    wav.write(out_path, tts.sample_rate, (audio * 32767).astype(np.int16))
-    print(f"[TTS] 已保存到 {out_path}")
+    print("ChatTTS 交互测试，输入文本后回车合成并播放，exit 退出。")
+    print("支持韵律标签：[uv_break] [lbreak] [laugh] [oral_0~9] [speed_1~10]")
+    print("生成的 wav 文件保存在当前目录，文件名为 tts_001.wav、tts_002.wav ...")
+    print("-" * 50)
+    idx = 1
+    while True:
+        try:
+            text = input("\n[输入] > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n退出。")
+            break
+        if not text or text.lower() == "exit":
+            break
+        audio = tts.synthesize(text)
+        dur = len(audio) / tts.sample_rate
+        out_path = f"tts_{idx:03d}.wav"
+        wav.write(out_path, tts.sample_rate, (audio * 32767).astype(np.int16))
+        print(f"[TTS] 音频时长: {dur:.2f}s，已保存: {out_path}")
+        subprocess.Popen(["afplay", out_path])
+        idx += 1

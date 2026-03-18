@@ -53,13 +53,17 @@
 - 接口：OpenAI Chat API 兼容格式，支持任意兼容服务（OpenAI / 阿里云百炼 Qwen / DeepSeek 等）
 - 输出方式：流式（stream=True），逐 token 打印，降低首字延迟
 - 对话历史：保留最近 10 轮，超出后自动滚动
-- 提示词：默认口语化、简短风格，适合朗读
+- 提示词：性感活泼女性风格，口语化简短回复，并指导 LLM 在合适位置插入 ChatTTS 韵律标签
 
 ### 语音合成（TTS）
 
-- 主选：[ChatTTS](https://github.com/2noise/ChatTTS)，本地推理，中文女声，24kHz，约 3GB 模型
+- 主选：[ChatTTS](https://github.com/2noise/ChatTTS)，本地推理，24kHz，约 3GB 模型
 - 备选：[edge-tts](https://github.com/rany2/edge-tts)，微软在线 TTS，`zh-CN-XiaoxiaoNeural`，需联网
 - 自动降级：ChatTTS 未安装时自动切换到 edge-tts，无需手动配置
+- 音色：通过 `CHATTTS_SPEAKER_SEED` 固定音色（默认 4000，女声），可扫描种子批量试听
+- 韵律控制：支持在文本中插入标签 `[uv_break]`（短停顿）、`[lbreak]`（长停顿）、`[laugh]`（笑声）、`[oral_0~9]`（口语化程度）；LLM 系统提示已配置为自动插入这些标签
+- 推理速度：M 系芯片 CPU 推理，RTF ≈ 0.8~1.2（合成 1 秒音频约需 1 秒），GPT 核心不支持 MPS 加速
+- `tts.py` 可独立运行，交互式输入文本测试合成效果并保存 wav 文件
 
 ### 音频播放与打断
 
