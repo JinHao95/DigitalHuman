@@ -68,13 +68,16 @@ class TTSEngine:
         if not clean_text:
             return np.zeros(1, dtype=np.float32)
 
-        # ChatTTS 0.2.x：InferCodeParams 用 prompt 控制语速，不再单独有 speed 参数
+        # ChatTTS 0.2.x：InferCodeParams 用 prompt 控制语速
+        # max_new_token 按文字长度动态设定，每字约 15 token，避免跑满 2048 导致超时
+        max_tokens = max(200, len(clean_text) * 15)
         params_infer = self.chat.InferCodeParams(
             spk_emb=self._spk,
             temperature=TEMPERATURE,
             top_P=TOP_P,
             top_K=TOP_K,
             prompt=f"[speed_{SPEED}]",
+            max_new_token=max_tokens,
         )
 
         try:
@@ -129,6 +132,7 @@ class TTSEngine:
         text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
         # 全角标点转半角（ChatTTS 对全角感叹号等有警告）
         text = text.replace("！", "!").replace("？", "?").replace("，", ",").replace("。", ".")
+        text = text.replace("～", "").replace("~", "").replace("…", "...")
         # 去掉多余空白
         text = re.sub(r"\s+", " ", text).strip()
         return text
