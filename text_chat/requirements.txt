@@ -1,0 +1,14 @@
+# 依赖与 voice_chat 相同，直接复用其 venv
+# 激活方式：source ../voice_chat/venv/bin/activate
+
+# LLM
+openai
+
+# TTS（优先 ChatTTS，降级到 edge-tts）
+edge-tts
+soundfile
+scipy
+
+# 音频播放
+sounddevice
+numpy<2
