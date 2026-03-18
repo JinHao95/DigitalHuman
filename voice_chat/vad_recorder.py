@@ -54,11 +54,14 @@ class VoiceRecorder:
         self.vad = webrtcvad.Vad(vad_aggressiveness)
 
         self._ring_size = int(silence_threshold * 1000 / frame_duration_ms)
+        # 前置缓冲：保留说话触发前的 0.5 秒音频，防止截掉开头
+        self._pre_buf_size = int(500 / frame_duration_ms)  # 0.5s
 
         # 内部状态（每次 record_once 重置）
         self._audio_buffer: list[np.ndarray] = []
         self._ring: collections.deque = collections.deque(maxlen=self._ring_size)        # VAD bool 结果
         self._audio_ring: collections.deque = collections.deque(maxlen=self._ring_size)  # 对应音频帧
+        self._pre_buf: collections.deque = collections.deque(maxlen=self._pre_buf_size)  # 前置缓冲（所有帧）
         self._frame_queue: collections.deque = collections.deque()
         self._stop_event   = threading.Event()
         self._result_audio: np.ndarray | None = None
@@ -102,6 +105,7 @@ class VoiceRecorder:
         self._audio_buffer = []
         self._ring.clear()
         self._audio_ring.clear()
+        self._pre_buf.clear()
         self._frame_queue.clear()
         self._stop_event.clear()
         self._result_audio = None
@@ -170,12 +174,13 @@ class VoiceRecorder:
             if state == "WAITING":
                 self._ring.append(is_speech)
                 self._audio_ring.append(frame_float)
+                self._pre_buf.append(frame_float)   # 始终记录前置缓冲
                 # 当滑动窗口中语音帧占多数时，认为用户开始说话
                 if sum(self._ring) >= len(self._ring) * 0.75:
                     state = "RECORDING"
                     print("[VAD] 检测到说话，开始录音...")
-                    # 把音频 ring buffer 里的历史帧加进去（避免截掉开头）
-                    voiced_frames.extend(list(self._audio_ring))
+                    # 用前置缓冲（最近 0.5s 所有帧）避免截掉开头
+                    voiced_frames.extend(list(self._pre_buf))
                     speech_frame_count = len(voiced_frames)
                     silence_frame_count = 0
 
@@ -202,6 +207,7 @@ class VoiceRecorder:
                         silence_frame_count = 0
                         self._ring.clear()
                         self._audio_ring.clear()
+                        self._pre_buf.clear()
 
                 # 防止超长录音卡死
                 if speech_frame_count >= self.max_record_frames:
