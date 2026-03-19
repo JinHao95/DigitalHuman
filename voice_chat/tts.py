@@ -20,7 +20,7 @@ SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "9000"))
 TEMPERATURE   = float(os.getenv("CHATTTS_TEMPERATURE",   "0.3"))
 TOP_P         = float(os.getenv("CHATTTS_TOP_P",         "0.7"))
 TOP_K         = int(os.getenv("CHATTTS_TOP_K",           "20"))
-SPEED         = int(os.getenv("CHATTTS_SPEED",           "5"))    # 1~10
+SPEED         = int(os.getenv("CHATTTS_SPEED",           "2"))    # 1~10，2 慢速自然
 
 CHATTTS_SAMPLE_RATE = 24000   # ChatTTS 输出采样率固定为 24kHz
 
@@ -125,8 +125,14 @@ class TTSEngine:
     def _clean_text(text: str) -> str:
         """移除 Markdown、emoji、特殊符号等不适合朗读的内容，保留 ChatTTS 韵律标签。"""
         # 先把 ChatTTS 标签占位保存，避免后续正则误伤
-        # 支持的标签：[uv_break] [lbreak] [laugh] [oral_N] [speed_N]
-        _TAG_RE = re.compile(r'\[(uv_break|lbreak|laugh|oral_\d|speed_\d+)\]')
+        # 支持的标签白名单（来自 tokenizer_config.json）
+        # [speed_N] 不写入文本，直接剥掉（语速由 InferCodeParams.prompt 控制）
+        _TAG_RE = re.compile(
+            r'\[(uv_break|v_break|lbreak|llbreak|break_[0-7]'
+            r'|laugh|laugh_[0-2]|oral_\d|music|pure)\]'
+        )
+        _STRIP_RE = re.compile(r'\[speed_\d+\]')
+        text = _STRIP_RE.sub('', text)  # 先剥掉 [speed_N]，不让它进入文本
         tags = _TAG_RE.findall(text)
         # 用占位符替换标签（ASCII 不会被后续正则删掉）
         placeholder_map = {}
@@ -145,8 +151,11 @@ class TTSEngine:
         text = re.sub(r"#+\s*", "", text)
         text = re.sub(r"`+", "", text)
         text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
-        # 全角标点转半角（ChatTTS 对全角感叹号等有警告）
-        text = text.replace("！", "!").replace("？", "?").replace("，", ",").replace("。", ".")
+        # 全角标点处理：感叹号/问号直接去掉（ChatTTS 读不出语气，反而产生停顿）
+        # 逗号句号保留，ChatTTS 用它们控制节奏
+        text = text.replace("！", "").replace("!", "")
+        text = text.replace("？", "").replace("?", "")
+        text = text.replace("，", ",").replace("。", ".")
         text = text.replace("～", "").replace("~", "").replace("…", "...")
         # 去掉多余空白
         text = re.sub(r"\s+", " ", text).strip()
@@ -154,6 +163,14 @@ class TTSEngine:
         # 还原 ChatTTS 标签
         for ph, tag in placeholder_map.items():
             text = text.replace(ph, tag)
+
+        # 兜底：标签后面没有实质文字（只有空白/标点/字符串末尾）就剥掉
+        # 切段后每段独立送 TTS，段末标签 = 音频截断，宁可没效果也不截字
+        _TRAIL_TAG = re.compile(
+            r'\[(?:uv_break|v_break|lbreak|llbreak|break_[0-7]|laugh|laugh_[0-2]|oral_\d)\]'
+            r'(?=[,，.。\s]*$)'
+        )
+        text = _TRAIL_TAG.sub('', text).strip()
         return text
 
 
