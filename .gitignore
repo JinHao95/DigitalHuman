@@ -12,6 +12,7 @@ build/
 venv/
 venv_x86_backup/
 .venv/
+text_chat/venv
 
 # 测试临时文件
 test_output.wav
