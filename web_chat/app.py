@@ -35,6 +35,37 @@ print("[初始化] GPU 预热中...")
 tts.synthesize("你好")  # warm-up：消除首次推理的 GPU 冷启动开销
 print("[初始化] 完成，服务就绪！")
 
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ─────────────────────── 工具函数 ───────────────────────
+
+def _synth_segments(segments: list) -> list:
+    """
+    将文本段列表逐段合成为音频文件，返回对应的 URL 路径列表。
+    文件存储为 _seg_0.wav, _seg_1.wav ...
+    """
+    urls = []
+    idx = 0
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        audio = tts.synthesize(seg)
+        path = os.path.join(_DIR, f"_seg_{idx}.wav")
+        buf = io.BytesIO()
+        wav.write(buf, tts.sample_rate, (audio * 32767).astype(np.int16))
+        with open(path, "wb") as f:
+            f.write(buf.getvalue())
+        urls.append(f"/audio/{idx}")
+        idx += 1
+    return urls
+
+
+def _split_segments(text: str) -> list:
+    """按换行符拆分文本段，过滤空行。"""
+    return [s.strip() for s in text.split("\n") if s.strip()]
+
+
 # ─────────────────────── HTML 页面 ───────────────────────
 HTML = """
 <!DOCTYPE html>
@@ -42,20 +73,29 @@ HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>数字人对话</title>
+<title>直播陪聊</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
          background: #0f0f1a; color: #e0e0e0; height: 100vh; display: flex;
-         flex-direction: column; align-items: center; padding: 24px; }
-  h1 { color: #a78bfa; margin-bottom: 20px; font-size: 1.4rem; }
+         flex-direction: column; align-items: center; padding: 16px 24px; }
+  header { width: 100%; max-width: 720px; display: flex; align-items: center;
+           justify-content: space-between; margin-bottom: 14px; }
+  .title { color: #a78bfa; font-size: 1.3rem; font-weight: bold; }
+  .nickname-wrap { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; color: #9ca3af; }
+  #nick-display { color: #f9a8d4; font-weight: bold; cursor: pointer;
+                  border-bottom: 1px dashed #f9a8d4; padding-bottom: 1px; }
+  #nick-input { display: none; background: #1f2937; border: 1px solid #7c3aed;
+                color: #e0e0e0; border-radius: 6px; padding: 3px 8px; font-size: 0.9rem; outline: none; }
   #chat-box { width: 100%; max-width: 720px; flex: 1; overflow-y: auto;
               background: #1a1a2e; border-radius: 12px; padding: 16px;
-              display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
-  .msg { padding: 10px 14px; border-radius: 10px; max-width: 80%; line-height: 1.5; }
+              display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+  .msg { padding: 10px 14px; border-radius: 10px; max-width: 82%; line-height: 1.6; word-break: break-word; }
   .user { background: #4c1d95; align-self: flex-end; }
+  .user-label { font-size: 0.78rem; color: #c4b5fd; display: block; margin-bottom: 3px; }
   .ai   { background: #1e3a5f; align-self: flex-start; }
-  .sys  { color: #6b7280; font-size: 0.8rem; align-self: center; }
+  .ai-label { font-size: 0.78rem; color: #7dd3fc; display: block; margin-bottom: 3px; }
+  .sys  { color: #6b7280; font-size: 0.78rem; align-self: center; text-align: center; }
   #input-row { display: flex; width: 100%; max-width: 720px; gap: 10px; }
   #user-input { flex: 1; padding: 12px 16px; border-radius: 8px; border: 1px solid #374151;
                 background: #1f2937; color: #e0e0e0; font-size: 1rem; outline: none; }
@@ -64,39 +104,82 @@ HTML = """
               border-radius: 8px; cursor: pointer; font-size: 1rem; transition: background 0.2s; }
   #send-btn:hover { background: #6d28d9; }
   #send-btn:disabled { background: #374151; cursor: not-allowed; }
-  audio { width: 100%; margin-top: 6px; border-radius: 6px; }
 </style>
 </head>
 <body>
-<h1>🤖 数字人对话</h1>
+<header>
+  <div class="title">🎙 小晴的直播间</div>
+  <div class="nickname-wrap">
+    <span>我的昵称：</span>
+    <span id="nick-display" title="点击修改昵称"></span>
+    <input id="nick-input" type="text" maxlength="12" placeholder="输入昵称回车确认" />
+  </div>
+</header>
 <div id="chat-box"></div>
 <div id="input-row">
-  <input id="user-input" type="text" placeholder="输入消息，回车发送..." autofocus />
+  <input id="user-input" type="text" placeholder="说点什么吧..." autofocus />
   <button id="send-btn" onclick="sendMsg()">发送</button>
 </div>
 
 <script>
+// ── 昵称管理 ──
+const PREFIXES = ['小可爱', '宝贝', '亲爱的', '小甜心', '小心肝', '小宝贝'];
+function genNick() {
+  const p = PREFIXES[Math.floor(Math.random() * PREFIXES.length)];
+  const n = String(Math.floor(Math.random() * 900) + 100);
+  return p + n;
+}
+let username = localStorage.getItem('dh_nick') || genNick();
+localStorage.setItem('dh_nick', username);
+
+const nickDisplay = document.getElementById('nick-display');
+const nickInput   = document.getElementById('nick-input');
+nickDisplay.textContent = username;
+
+nickDisplay.addEventListener('click', () => {
+  nickInput.value = username;
+  nickDisplay.style.display = 'none';
+  nickInput.style.display = 'inline-block';
+  nickInput.focus();
+});
+nickInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') confirmNick();
+});
+nickInput.addEventListener('blur', confirmNick);
+function confirmNick() {
+  const v = nickInput.value.trim();
+  if (v) { username = v; localStorage.setItem('dh_nick', username); }
+  nickDisplay.textContent = username;
+  nickDisplay.style.display = 'inline';
+  nickInput.style.display = 'none';
+}
+
+// ── 聊天渲染 ──
 const chatBox = document.getElementById('chat-box');
 const input   = document.getElementById('user-input');
 const sendBtn = document.getElementById('send-btn');
 
 input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
 
-function addMsg(role, text, audioUrl) {
+function addMsg(role, text, nick) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
-  div.textContent = text;
-  if (audioUrl) {
-    const audio = document.createElement('audio');
-    audio.controls = true;
-    audio.autoplay = true;
-    audio.src = audioUrl;
-    div.appendChild(audio);
+  const label = document.createElement('span');
+  if (role === 'user') {
+    label.className = 'user-label';
+    label.textContent = (nick || username) + '：';
+  } else {
+    label.className = 'ai-label';
+    label.textContent = '🎙 小晴：';
   }
+  const content = document.createElement('span');
+  content.textContent = text;
+  div.appendChild(label);
+  div.appendChild(content);
   chatBox.appendChild(div);
   chatBox.scrollTop = chatBox.scrollHeight;
+  return div;
 }
-
 function addSys(text) {
   const div = document.createElement('div');
   div.className = 'msg sys';
@@ -106,42 +189,154 @@ function addSys(text) {
   return div;
 }
 
+// ── 音频队列逐段播放 ──
+let audioQueue = [];
+let isPlaying = false;
+let doneCallback = null;
+
+function playQueue(urls, onDone) {
+  audioQueue = [...urls];
+  isPlaying = true;
+  doneCallback = onDone || null;
+  playNext();
+}
+function playNext() {
+  if (audioQueue.length === 0) {
+    isPlaying = false;
+    resetIdleTimer();
+    if (doneCallback) { doneCallback(); doneCallback = null; }
+    return;
+  }
+  const url = audioQueue.shift() + '?t=' + Date.now();
+  const audio = new Audio(url);
+  audio.addEventListener('ended', playNext);
+  audio.addEventListener('error', playNext);
+  audio.play().catch(playNext);
+}
+
+// ── 冷场检测 ──
+let idleTimer = null;
+const IDLE_SEC = 20;
+
+function resetIdleTimer() {
+  clearTimeout(idleTimer);
+  if (isBusy || isPlaying) return;
+  idleTimer = setTimeout(triggerIdle, IDLE_SEC * 1000);
+}
+async function triggerIdle() {
+  if (isBusy || isPlaying) { resetIdleTimer(); return; }
+  try {
+    const res = await fetch('/idle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username })
+    });
+    const data = await res.json();
+    if (data.segments) {
+      data.segments.forEach(s => addMsg('ai', s));
+      playQueue(data.audio_urls);
+    }
+  } catch(e) {}
+}
+
+// ── 发送消息 ──
+let isBusy = false;
+
 async function sendMsg() {
   const text = input.value.trim();
-  if (!text) return;
+  if (!text || isBusy) return;
   input.value = '';
+  isBusy = true;
   sendBtn.disabled = true;
+  clearTimeout(idleTimer);
 
   addMsg('user', text);
-  const status = addSys('AI 思考中...');
+  const status = addSys('小晴思考中...');
 
   try {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
+      body: JSON.stringify({ text, username })
     });
     const data = await res.json();
     status.remove();
 
     if (data.error) {
-      addSys('❌ 错误：' + data.error);
+      addSys('❌ ' + data.error);
     } else {
-      addMsg('ai', data.ai_text, data.audio_url);
-      const info = `LLM ${data.llm_time}s | TTS ${data.tts_time}s | 音频 ${data.audio_dur}s`;
-      addSys(info);
+      data.segments.forEach(s => addMsg('ai', s));
+      playQueue(data.audio_urls);
     }
   } catch (e) {
     status.textContent = '❌ 请求失败：' + e.message;
   } finally {
+    isBusy = false;
     sendBtn.disabled = false;
     input.focus();
+    resetIdleTimer();
   }
 }
+
+// ── 进入直播间 ──
+async function onEnter() {
+  isBusy = true;
+  clearTimeout(idleTimer);
+  try {
+    const res = await fetch('/enter', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username })
+    });
+    const data = await res.json();
+    if (data.segments) {
+      data.segments.forEach(s => addMsg('ai', s));
+      playQueue(data.audio_urls);
+    }
+  } catch(e) {}
+  finally {
+    isBusy = false;
+    resetIdleTimer();
+  }
+}
+
+// 页面加载完成后触发进入事件
+window.addEventListener('load', () => setTimeout(onEnter, 500));
 </script>
 </body>
 </html>
 """
+
+# ─────────────────────── 公共处理函数 ───────────────────────
+
+def _handle_request(prompt_text):
+    """LLM → 按段 TTS → 返回 segments + audio_urls。"""
+    import time
+    t0 = time.time()
+    try:
+        ai_text = "".join(llm.chat_stream(prompt_text))
+    except Exception as e:
+        return {"error": f"LLM 错误: {e}"}
+    llm_time = round(time.time() - t0, 2)
+
+    segments = _split_segments(ai_text)
+    if not segments:
+        segments = [ai_text.strip()] if ai_text.strip() else ["嗯～"]
+
+    t1 = time.time()
+    try:
+        audio_urls = _synth_segments(segments)
+    except Exception as e:
+        return {"error": f"TTS 错误: {e}"}
+    tts_time = round(time.time() - t1, 2)
+
+    return {
+        "segments":   segments,
+        "audio_urls": audio_urls,
+        "llm_time":   llm_time,
+        "tts_time":   tts_time,
+    }
+
 
 # ─────────────────────── API ───────────────────────
 
@@ -153,59 +348,54 @@ def index():
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
-    text = (data or {}).get("text", "").strip()
+    text     = (data or {}).get("text", "").strip()
+    username = (data or {}).get("username", "宝贝").strip() or "宝贝"
     if not text:
         return jsonify({"error": "消息为空"}), 400
 
-    import time
-
-    # LLM
-    t0 = time.time()
-    try:
-        ai_text = "".join(llm.chat_stream(text))
-    except Exception as e:
-        return jsonify({"error": f"LLM 错误: {e}"}), 500
-    llm_time = round(time.time() - t0, 2)
-
-    # TTS
-    t1 = time.time()
-    try:
-        audio = tts.synthesize(ai_text)
-    except Exception as e:
-        return jsonify({"error": f"TTS 错误: {e}"}), 500
-    tts_time = round(time.time() - t1, 2)
-    audio_dur = round(len(audio) / tts.sample_rate, 1)
-
-    # 转为 WAV bytes
-    buf = io.BytesIO()
-    wav.write(buf, tts.sample_rate, (audio * 32767).astype(np.int16))
-    buf.seek(0)
-
-    # 把音频存临时文件，通过 /audio 接口返回
-    audio_path = os.path.join(os.path.dirname(__file__), "_last_audio.wav")
-    with open(audio_path, "wb") as f:
-        f.write(buf.read())
-
-    return jsonify({
-        "ai_text":   ai_text,
-        "audio_url": "/audio",
-        "llm_time":  llm_time,
-        "tts_time":  tts_time,
-        "audio_dur": audio_dur,
-    })
+    prompt = f"[{username}说]：{text}"
+    result = _handle_request(prompt)
+    if "error" in result:
+        return jsonify(result), 500
+    return jsonify(result)
 
 
-@app.route("/audio")
-def audio():
-    audio_path = os.path.join(os.path.dirname(__file__), "_last_audio.wav")
-    if not os.path.exists(audio_path):
+@app.route("/enter", methods=["POST"])
+def enter():
+    data = request.get_json()
+    username = (data or {}).get("username", "宝贝").strip() or "宝贝"
+    prompt = f"[系统通知]：用户「{username}」刚刚进入了直播间，请主动欢迎他，要热情、带情绪、自然活泼。"
+    result = _handle_request(prompt)
+    if "error" in result:
+        return jsonify(result), 500
+    return jsonify(result)
+
+
+@app.route("/idle", methods=["POST"])
+def idle():
+    data = request.get_json()
+    username = (data or {}).get("username", "").strip()
+    if username:
+        prompt = f"[系统通知]：直播间已经有一段时间没人说话了，「{username}」还在线，请主动发起一个轻松有趣的话题，吸引他继续聊天。"
+    else:
+        prompt = "[系统通知]：直播间已经有一段时间没人说话了，请主动发起一个轻松有趣的话题，营造气氛。"
+    result = _handle_request(prompt)
+    if "error" in result:
+        return jsonify(result), 500
+    return jsonify(result)
+
+
+@app.route("/audio/<int:idx>")
+def audio(idx):
+    path = os.path.join(_DIR, f"_seg_{idx}.wav")
+    if not os.path.exists(path):
         return "Not found", 404
-    return send_file(audio_path, mimetype="audio/wav")
+    return send_file(path, mimetype="audio/wav")
 
 
 @app.route("/seed_samples/<filename>")
 def seed_sample(filename):
-    sample_dir = os.path.join(os.path.dirname(__file__), "..", "voice_chat", "seed_samples")
+    sample_dir = os.path.join(_DIR, "..", "voice_chat", "seed_samples")
     return send_file(os.path.join(sample_dir, filename), mimetype="audio/wav")
 
 
