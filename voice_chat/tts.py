@@ -20,7 +20,7 @@ SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "9000"))
 TEMPERATURE   = float(os.getenv("CHATTTS_TEMPERATURE",   "0.3"))
 TOP_P         = float(os.getenv("CHATTTS_TOP_P",         "0.7"))
 TOP_K         = int(os.getenv("CHATTTS_TOP_K",           "20"))
-SPEED         = int(os.getenv("CHATTTS_SPEED",           "2"))    # 1~10，2 慢速自然
+SPEED         = int(os.getenv("CHATTTS_SPEED",           "1"))    # 1~10，1 最慢
 
 CHATTTS_SAMPLE_RATE = 24000   # ChatTTS 输出采样率固定为 24kHz
 
@@ -70,11 +70,22 @@ class TTSEngine:
         clean_text = self._clean_text(text)
         if not clean_text:
             return np.zeros(1, dtype=np.float32)
+        if clean_text != text:
+            print(f"[TTS] clean: {text!r} -> {clean_text!r}")
+
+        # 末尾补一个 [uv_break]，让 ChatTTS 生成最后一个字的完整尾音，防止吞音
+        if not clean_text.endswith('[uv_break]'):
+            clean_text = clean_text + '[uv_break]'
+
+        # 每次合成前重新固定随机种子，防止音色漂移（ChatTTS 内部 DVAE 受全局随机状态影响）
+        if SPEAKER_SEED is not None:
+            import torch
+            torch.manual_seed(SPEAKER_SEED)
 
         # ChatTTS 0.2.x：InferCodeParams 用 prompt 控制语速
         # max_new_token 按文字长度动态设定，每字约 12 token，下限 80
         # 避免 max_new_token 过大导致模型空跑浪费时间
-        max_tokens = max(80, len(clean_text) * 12)
+        max_tokens = max(100, len(clean_text) * 15)
         params_infer = self.chat.InferCodeParams(
             spk_emb=self._spk,
             temperature=TEMPERATURE,
@@ -99,6 +110,9 @@ class TTSEngine:
                 peak = np.abs(audio).max()
                 if peak > 0:
                     audio = audio / peak * 0.9
+                # 末尾追加 0.35s 静音，防止最后一字被截断（吞音）
+                silence = np.zeros(int(CHATTTS_SAMPLE_RATE * 0.35), dtype=np.float32)
+                audio = np.concatenate([audio, silence])
                 return audio
             else:
                 print("[TTS] 合成失败：输出为空")
@@ -164,13 +178,16 @@ class TTSEngine:
         for ph, tag in placeholder_map.items():
             text = text.replace(ph, tag)
 
-        # 兜底：标签后面没有实质文字（只有空白/标点/字符串末尾）就剥掉
-        # 切段后每段独立送 TTS，段末标签 = 音频截断，宁可没效果也不截字
+        # 兜底：末尾标签循环剥掉，直到尾部没有任何标签为止
+        # 判断标准：标签后面不存在任何中文/英文/数字实质内容
         _TRAIL_TAG = re.compile(
             r'\[(?:uv_break|v_break|lbreak|llbreak|break_[0-7]|laugh|laugh_[0-2]|oral_\d)\]'
-            r'(?=[,，.。\s]*$)'
+            r'[^\u4e00-\u9fffA-Za-z0-9]*$'
         )
-        text = _TRAIL_TAG.sub('', text).strip()
+        prev = None
+        while prev != text:
+            prev = text
+            text = _TRAIL_TAG.sub('', text).strip()
         return text
 
 

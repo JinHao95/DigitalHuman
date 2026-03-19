@@ -2,9 +2,11 @@
 web_chat/app.py
 Web 版数字人：浏览器输入文字 → LLM → TTS → 浏览器播放音频
 
-架构：SSE 流式推送 + 流水线并行
-  LLM stream → 按换行切段 → 每段立即提交线程池 TTS
-  → TTS 完成 → SSE push 段索引 → 前端边收边播
+架构：多人广播模式
+  每个用户持有一条 GET /events SSE 长连接（广播通道）
+  用户发言 POST /stream → 入队 _reply_queue
+  _reply_worker 单线程串行处理：LLM → 切段 → TTS → broadcast 给所有在线用户
+  所有用户都能看到和听到主播的回复
 """
 
 import io
@@ -13,6 +15,8 @@ import sys
 import json
 import uuid
 import time
+import queue
+import threading
 import logging
 import datetime
 import numpy as np
@@ -43,7 +47,6 @@ _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s
 logger = logging.getLogger("app")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(_handler)
-# 同时输出到终端
 _stream_handler = logging.StreamHandler()
 _stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
 logger.addHandler(_stream_handler)
@@ -62,13 +65,74 @@ _t0 = time.time()
 tts.synthesize("你好")
 logger.info(f"TTS 预热完成，耗时 {time.time()-_t0:.1f}s，服务就绪")
 
-# TTS 线程池：GPU 是串行资源，用单线程池保证顺序且不阻塞 Flask 主线程
+# TTS 线程池：GPU 串行资源，单线程池
 _tts_pool = ThreadPoolExecutor(max_workers=1)
+
+
+# ─────────────────────── 广播管理 ───────────────────────
+
+# username → list of {"q": Queue, "dead": bool}
+# 每条 tab 连接对应一个 entry，dead=True 表示连接已断
+_sse_clients: dict[str, list] = {}
+_sse_lock = threading.Lock()
+
+
+class _Client:
+    """代表一条 SSE 长连接。"""
+    def __init__(self, client_id: str, username: str):
+        self.client_id = client_id
+        self.username  = username
+        self.q    = queue.Queue(maxsize=100)
+        self.dead = False
+
+
+# client_id → _Client，精确管理每条连接
+_sse_clients: dict[str, "_Client"] = {}
+_sse_lock = threading.Lock()
+
+
+def _register_client(client_id: str, username: str) -> "_Client":
+    c = _Client(client_id, username)
+    with _sse_lock:
+        _sse_clients[client_id] = c
+    logger.info(f"[SSE] 注册 {username}({client_id})，在线: {online_count()}")
+    return c
+
+
+def _unregister_client(client_id: str):
+    with _sse_lock:
+        c = _sse_clients.pop(client_id, None)
+    if c:
+        c.dead = True
+        logger.info(f"[SSE] 注销 {c.username}({client_id})，在线: {online_count()}")
+
+
+def broadcast(event: dict):
+    """向所有在线连接广播，写入失败的连接自动清理。"""
+    msg = _sse(event)
+    dead_ids = []
+    with _sse_lock:
+        snapshot = list(_sse_clients.items())
+    for cid, c in snapshot:
+        if c.dead:
+            dead_ids.append(cid)
+            continue
+        try:
+            c.q.put_nowait(msg)
+        except queue.Full:
+            logger.warning(f"[SSE] {c.username}({cid}) 队列满，标记清理")
+            dead_ids.append(cid)
+    for cid in dead_ids:
+        _unregister_client(cid)
+
+
+def online_count() -> int:
+    with _sse_lock:
+        return len(_sse_clients)
 
 
 # ─────────────────────── 关系阶段 ───────────────────────
 
-# 每个用户的对话轮次（user 消息次数），用于推进关系阶段
 _user_state: dict[str, int] = {}
 
 _RELATION_STAGES = [
@@ -94,12 +158,11 @@ def _inc_user_turns(username: str):
 # ─────────────────────── 对话日志 ───────────────────────
 
 def _log(role: str, username: str, text: str):
-    """追加一条对话记录到当天日志文件。"""
     today = datetime.date.today().isoformat()
     path  = os.path.join(_LOG_DIR, f"{today}.jsonl")
     record = {
         "ts":       datetime.datetime.now().isoformat(timespec="seconds"),
-        "role":     role,       # "user" / "ai" / "system"
+        "role":     role,
         "username": username,
         "text":     text,
     }
@@ -108,7 +171,6 @@ def _log(role: str, username: str, text: str):
 
 
 def _next_idle_prompt(username: str) -> str:
-    """冷场时让 LLM 自由发挥，自己想话题说。"""
     return (
         f"[系统通知]：直播间有一段时间没人说话了，「{username}」还在线。"
         "请你自己想一件最近发生的小事或者你的日常，随口分享出来，"
@@ -119,7 +181,6 @@ def _next_idle_prompt(username: str) -> str:
 # ─────────────────────── 工具 ───────────────────────
 
 def _synth_to_file(text: str, path: str) -> bool:
-    """TTS 合成并写入文件，返回是否成功。在 TTS 线程池中执行。"""
     t0 = time.time()
     try:
         audio = tts.synthesize(text)
@@ -142,33 +203,34 @@ def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-# ─────────────────────── 核心流式生成 ───────────────────────
+# ─────────────────────── 消息队列 + worker ───────────────────────
 
-def _stream_response(prompt_text: str, session_id: str, username: str, log_role: str):
+# 每条 item 结构：
+# { "username": str, "prompt": str, "log_role": str, "display_text": str or None }
+_reply_queue: queue.Queue = queue.Queue()
+
+
+def _stream_and_broadcast(item: dict):
     """
-    生成器：LLM 流式 → 切段 → 线程池 TTS → SSE 逐段推送。
-
-    流水线：LLM 每输出一个换行段，立刻提交 TTS；
-    主线程同时尝试 yield 已完成的段（保证顺序），
-    实现 LLM / TTS / 播放三者并行，首段延迟最低。
-
-    SSE 事件格式：
-      {"type": "seg",  "idx": 0, "text": "...", "url": "/audio_cache/xxx_0.wav"}
-      {"type": "done", "total": 3}
-      {"type": "error","msg": "..."}
+    在 _reply_worker 线程中同步执行：
+    LLM 流式 → 切段 → TTS 线程池 → broadcast 给所有在线用户
     """
-    req_start = time.time()
-    logger.info(f"[REQ {session_id}] 开始 | user={username} | role={log_role} | prompt={prompt_text[:60]!r}")
-
     import re as _re
-    _TAG_ONLY = _re.compile(r'^(\[[\w_]+\]|…+|～+|\s)*$')  # 纯标签/纯省略号，无实质文字
+    _TAG_ONLY = _re.compile(r'^(\[[\w_]+\]|…+|～+|\s)*$')
+
+    username    = item["username"]
+    prompt_text = item["prompt"]
+    log_role    = item["log_role"]
+    session_id  = uuid.uuid4().hex[:8]
+    req_start   = time.time()
+
+    logger.info(f"[REQ {session_id}] 开始 | user={username} | role={log_role} | prompt={prompt_text[:60]!r}")
 
     buffer     = ""
     seg_idx    = 0
-    pending    = []   # list of (idx, text, fname, future)
-    all_segs   = []   # 收集所有段文字，用于日志
-    carry_over = ""   # 纯标签段暂存，拼到下一个实质段前面
-    llm_done_time = None
+    pending    = []
+    all_segs   = []
+    carry_over = ""
 
     def submit_seg(text, idx):
         logger.debug(f"[REQ {session_id}] 提交TTS seg{idx} | {text[:40]!r}")
@@ -179,12 +241,10 @@ def _stream_response(prompt_text: str, session_id: str, username: str, log_role:
         all_segs.append(text)
 
     def try_emit(line):
-        """判断是否实质段；纯标签暂存 carry_over，实质段拼上后提交。"""
         nonlocal seg_idx, carry_over
         if not line:
             return
         if _TAG_ONLY.match(line):
-            # 纯标签/省略号：暂存，拼到下一实质段开头
             carry_over += line
             logger.debug(f"[REQ {session_id}] 暂存纯标签 {line!r}")
         else:
@@ -193,10 +253,28 @@ def _stream_response(prompt_text: str, session_id: str, username: str, log_role:
             submit_seg(full, seg_idx)
             seg_idx += 1
 
+    def drain_pending(wait: bool):
+        i = 0
+        while i < len(pending):
+            idx, text, fname, fut = pending[i]
+            if i == 0 or wait:
+                ok = fut.result()
+            else:
+                if not fut.done():
+                    break
+                ok = fut.result()
+            if ok:
+                broadcast({"type": "seg", "idx": idx, "text": text,
+                           "url": f"/audio_cache/{fname}"})
+            i += 1
+        del pending[:i]
+
+    # 通知前端：主播开始回复
+    broadcast({"type": "ai_speaking", "value": True})
+
     try:
         for chunk in llm.chat_stream(prompt_text):
             buffer += chunk
-            # 按换行 或 句末标点切段，不等 LLM 全部输出
             while True:
                 nl = buffer.find("\n")
                 punct_pos = -1
@@ -215,54 +293,50 @@ def _stream_response(prompt_text: str, session_id: str, username: str, log_role:
                 else:
                     break
                 try_emit(line)
-                yield from _drain_pending(pending, wait=False)
+                drain_pending(wait=False)
 
-        llm_done_time = time.time()
-        logger.info(f"[REQ {session_id}] LLM完成 {llm_done_time - req_start:.2f}s | {seg_idx}段")
+        logger.info(f"[REQ {session_id}] LLM完成 {time.time()-req_start:.2f}s | {seg_idx}段")
 
         last = buffer.strip()
         if last:
             try_emit(last)
-        # carry_over 里还有未拼出的纯标签，直接丢弃（不提交，避免爆音）
         carry_over = ""
-
-        yield from _drain_pending(pending, wait=True)
+        drain_pending(wait=True)
 
     except Exception as e:
         logger.error(f"[REQ {session_id}] 异常: {e}", exc_info=True)
-        yield _sse({"type": "error", "msg": str(e)})
+        broadcast({"type": "error", "msg": str(e)})
+        broadcast({"type": "ai_speaking", "value": False})
         return
 
-    # 记录 AI 完整回复
     if all_segs:
         _log("ai", username, "\n".join(all_segs))
 
     total_time = time.time() - req_start
     logger.info(f"[REQ {session_id}] 完成 总耗时{total_time:.2f}s | {seg_idx}段推送完毕")
-    yield _sse({"type": "done", "total": seg_idx})
+    broadcast({"type": "done", "total": seg_idx})
+    broadcast({"type": "ai_speaking", "value": False})
 
 
-def _drain_pending(pending: list, wait: bool):
-    """
-    按顺序 yield 已完成的段 SSE 事件。
-    - 第一段（队列头）：始终阻塞等待，保证首段尽快推出去
-    - 后续段：只有 wait=True 才阻塞；wait=False 时遇到未完成就停
-    这样前端能在第一段 TTS 完成后立刻开始播，后续段在播放过程中陆续到达。
-    """
-    i = 0
-    while i < len(pending):
-        idx, text, fname, fut = pending[i]
-        if i == 0 or wait:
-            ok = fut.result()   # 第一段或收尾阶段：阻塞等待
-        else:
-            if not fut.done():
-                break           # 后续段未完成：先推出去已有的，下轮再来
-            ok = fut.result()
-        if ok:
-            yield _sse({"type": "seg", "idx": idx, "text": text,
-                        "url": f"/audio_cache/{fname}"})
-        i += 1
-    del pending[:i]
+def _reply_worker():
+    """后台单线程，串行消费 _reply_queue，保证 LLM/TTS 不并发。"""
+    logger.info("[Worker] _reply_worker 启动")
+    while True:
+        try:
+            item = _reply_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            _stream_and_broadcast(item)
+        except Exception as e:
+            logger.error(f"[Worker] 处理异常: {e}", exc_info=True)
+        finally:
+            _reply_queue.task_done()
+
+
+# 启动 worker 线程
+_worker_thread = threading.Thread(target=_reply_worker, daemon=True)
+_worker_thread.start()
 
 
 # ─────────────────────── HTML ───────────────────────
@@ -281,6 +355,9 @@ HTML = """
   header { width: 100%; max-width: 720px; display: flex; align-items: center;
            justify-content: space-between; margin-bottom: 14px; }
   .title { color: #a78bfa; font-size: 1.3rem; font-weight: bold; }
+  .header-right { display: flex; align-items: center; gap: 16px; }
+  .online-badge { font-size: 0.8rem; color: #6ee7b7; background: #064e3b;
+                  padding: 3px 10px; border-radius: 20px; }
   .nickname-wrap { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; color: #9ca3af; }
   #nick-display { color: #f9a8d4; font-weight: bold; cursor: pointer;
                   border-bottom: 1px dashed #f9a8d4; padding-bottom: 1px; }
@@ -291,6 +368,7 @@ HTML = """
               display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
   .msg { padding: 10px 14px; border-radius: 10px; max-width: 82%; line-height: 1.6; word-break: break-word; }
   .user { background: #4c1d95; align-self: flex-end; }
+  .user-self { background: #5b21b6; align-self: flex-end; }
   .user-label { font-size: 0.78rem; color: #c4b5fd; display: block; margin-bottom: 3px; }
   .ai   { background: #1e3a5f; align-self: flex-start; }
   .ai-label { font-size: 0.78rem; color: #7dd3fc; display: block; margin-bottom: 3px; }
@@ -302,7 +380,10 @@ HTML = """
   #send-btn { padding: 12px 24px; background: #7c3aed; color: white; border: none;
               border-radius: 8px; cursor: pointer; font-size: 1rem; transition: background 0.2s; }
   #send-btn:hover { background: #6d28d9; }
-  #send-btn:disabled { background: #374151; cursor: not-allowed; }
+  /* AI 正在说话的提示 */
+  .ai-speaking { color: #93c5fd; font-size: 0.78rem; align-self: center;
+                 animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
   /* 进入遮罩 */
   #enter-overlay {
     position: fixed; inset: 0; background: rgba(10,10,20,0.92);
@@ -326,10 +407,13 @@ HTML = """
 </div>
 <header>
   <div class="title">🎙 小晴的直播间</div>
-  <div class="nickname-wrap">
-    <span>我的昵称：</span>
-    <span id="nick-display" title="点击修改昵称"></span>
-    <input id="nick-input" type="text" maxlength="12" placeholder="输入昵称回车确认" />
+  <div class="header-right">
+    <span class="online-badge" id="online-badge">● 1 人在线</span>
+    <div class="nickname-wrap">
+      <span>我的昵称：</span>
+      <span id="nick-display" title="点击修改昵称"></span>
+      <input id="nick-input" type="text" maxlength="12" placeholder="输入昵称回车确认" />
+    </div>
   </div>
 </header>
 <div id="chat-box"></div>
@@ -339,6 +423,9 @@ HTML = """
 </div>
 
 <script>
+// ── clientId：每个 tab 唯一，刷新后重新生成，用于精确管理 SSE 连接 ──
+const clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
 // ── 昵称管理 ──
 const NICKNAMES = [
   '小可爱','宝贝','亲爱的','小甜心','小心肝','小宝贝',
@@ -346,10 +433,15 @@ const NICKNAMES = [
   '甜甜','暖心','小鹿','星星','小雨','夏天','初晴',
 ];
 function genNick() {
-  return NICKNAMES[Math.floor(Math.random() * NICKNAMES.length)];
+  const base = NICKNAMES[Math.floor(Math.random() * NICKNAMES.length)];
+  const num  = String(Math.floor(Math.random() * 900) + 100);  // 100~999
+  return base + num;
 }
-let username = localStorage.getItem('dh_nick') || genNick();
-localStorage.setItem('dh_nick', username);
+// sessionStorage：每个 tab 独立，避免同一浏览器多 tab 昵称相同
+// 优先用 sessionStorage，没有则随机生成新昵称（不复用 localStorage 里的）
+let username = sessionStorage.getItem('dh_nick') || genNick();
+sessionStorage.setItem('dh_nick', username);
+// localStorage 仅做最后一次手动修改的记忆，不在多 tab 间共享初始昵称
 
 const nickDisplay = document.getElementById('nick-display');
 const nickInput   = document.getElementById('nick-input');
@@ -365,7 +457,7 @@ nickInput.addEventListener('keydown', e => { if (e.key === 'Enter') confirmNick(
 nickInput.addEventListener('blur', confirmNick);
 function confirmNick() {
   const v = nickInput.value.trim();
-  if (v) { username = v; localStorage.setItem('dh_nick', username); }
+  if (v) { username = v; sessionStorage.setItem('dh_nick', username); }
   nickDisplay.textContent = username;
   nickDisplay.style.display = 'inline';
   nickInput.style.display = 'none';
@@ -377,12 +469,13 @@ const input   = document.getElementById('user-input');
 const sendBtn = document.getElementById('send-btn');
 input.addEventListener('keydown', e => { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); } });
 
-function addMsg(role, text) {
+function addMsg(role, text, nick) {
   const div = document.createElement('div');
-  div.className = 'msg ' + role;
+  // 自己发的消息用稍深的紫色区分
+  div.className = 'msg ' + (role === 'user' ? (nick === username ? 'user-self' : 'user') : role);
   const label = document.createElement('span');
   label.className = role === 'user' ? 'user-label' : 'ai-label';
-  label.textContent = role === 'user' ? username + '：' : '🎙 小晴：';
+  label.textContent = role === 'user' ? (nick || username) + '：' : '🎙 小晴：';
   const content = document.createElement('span');
   content.textContent = text;
   div.appendChild(label);
@@ -401,12 +494,11 @@ function addSys(text) {
 }
 
 // ── 背景音乐（Web Audio API 合成 lo-fi 鼓机）──
-// 动次打次节奏：kick(0) hat(0.5) snare(1.0) hat(1.5) 每2拍循环，BPM≈80
 let bgCtx = null;
 let bgGain = null;
 let bgStarted = false;
-const BG_VOL_NORMAL = 0.18;   // 正常音量
-const BG_VOL_DUCK   = 0.04;   // 说话时压低
+const BG_VOL_NORMAL = 0.18;
+const BG_VOL_DUCK   = 0.04;
 
 function _startBgMusic() {
   if (bgStarted) return;
@@ -420,31 +512,23 @@ function _startBgMusic() {
 
 function _scheduleBeat(startTime) {
   if (!bgCtx) return;
-  const bpm      = 82;
-  const beat     = 60 / bpm;       // 一拍时长（秒）
-  const barLen   = beat * 4;        // 一小节 = 4拍
-  const BARS     = 2;               // 每次预排 2 小节，减少 GC
-
+  const bpm    = 82;
+  const beat   = 60 / bpm;
+  const barLen = beat * 4;
+  const BARS   = 2;
   for (let bar = 0; bar < BARS; bar++) {
     const t0 = startTime + bar * barLen;
-    // kick  拍1 拍3
-    _kick(t0);
-    _kick(t0 + beat * 2);
-    // snare 拍2 拍4
-    _snare(t0 + beat);
-    _snare(t0 + beat * 3);
-    // hihat 每半拍
+    _kick(t0); _kick(t0 + beat * 2);
+    _snare(t0 + beat); _snare(t0 + beat * 3);
     for (let i = 0; i < 8; i++) _hat(t0 + i * beat * 0.5, i % 2 === 0 ? 0.55 : 0.35);
   }
-  // 循环调度
   const nextBar = startTime + BARS * barLen - 0.05;
   const delay   = (nextBar - bgCtx.currentTime) * 1000;
   setTimeout(() => _scheduleBeat(startTime + BARS * barLen), Math.max(delay, 0));
 }
 
 function _kick(t) {
-  const o = bgCtx.createOscillator();
-  const g = bgCtx.createGain();
+  const o = bgCtx.createOscillator(), g = bgCtx.createGain();
   o.connect(g); g.connect(bgGain);
   o.frequency.setValueAtTime(160, t);
   o.frequency.exponentialRampToValueAtTime(40, t + 0.15);
@@ -453,16 +537,13 @@ function _kick(t) {
   o.start(t); o.stop(t + 0.35);
 }
 function _snare(t) {
-  // noise burst
   const bufSize = Math.floor(bgCtx.sampleRate * 0.12);
-  const buf  = bgCtx.createBuffer(1, bufSize, bgCtx.sampleRate);
+  const buf = bgCtx.createBuffer(1, bufSize, bgCtx.sampleRate);
   const data = buf.getChannelData(0);
   for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1);
-  const src  = bgCtx.createBufferSource();
-  src.buffer = buf;
-  const flt  = bgCtx.createBiquadFilter();
-  flt.type = 'highpass'; flt.frequency.value = 1800;
-  const g   = bgCtx.createGain();
+  const src = bgCtx.createBufferSource(); src.buffer = buf;
+  const flt = bgCtx.createBiquadFilter(); flt.type = 'highpass'; flt.frequency.value = 1800;
+  const g = bgCtx.createGain();
   src.connect(flt); flt.connect(g); g.connect(bgGain);
   g.gain.setValueAtTime(0.6, t);
   g.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
@@ -470,13 +551,11 @@ function _snare(t) {
 }
 function _hat(t, vol) {
   const bufSize = Math.floor(bgCtx.sampleRate * 0.04);
-  const buf  = bgCtx.createBuffer(1, bufSize, bgCtx.sampleRate);
+  const buf = bgCtx.createBuffer(1, bufSize, bgCtx.sampleRate);
   const data = buf.getChannelData(0);
   for (let i = 0; i < bufSize; i++) data[i] = (Math.random() * 2 - 1);
-  const src = bgCtx.createBufferSource();
-  src.buffer = buf;
-  const flt = bgCtx.createBiquadFilter();
-  flt.type = 'highpass'; flt.frequency.value = 8000;
+  const src = bgCtx.createBufferSource(); src.buffer = buf;
+  const flt = bgCtx.createBiquadFilter(); flt.type = 'highpass'; flt.frequency.value = 8000;
   const g = bgCtx.createGain();
   src.connect(flt); flt.connect(g); g.connect(bgGain);
   g.gain.setValueAtTime(vol * 0.4, t);
@@ -484,28 +563,14 @@ function _hat(t, vol) {
   src.start(t); src.stop(t + 0.04);
 }
 
-function bgDuck()   { if (bgGain) bgGain.gain.linearRampToValueAtTime(BG_VOL_DUCK,   bgCtx.currentTime + 0.3); }
-function bgRestore(){ if (bgGain) bgGain.gain.linearRampToValueAtTime(BG_VOL_NORMAL, bgCtx.currentTime + 0.8); }
+function bgDuck()    { if (bgGain) bgGain.gain.linearRampToValueAtTime(BG_VOL_DUCK,   bgCtx.currentTime + 0.3); }
+function bgRestore() { if (bgGain) bgGain.gain.linearRampToValueAtTime(BG_VOL_NORMAL, bgCtx.currentTime + 0.8); }
 
-// ── 音频队列：边生成边播 ──
-let audioQueue = [];   // 待播 URL 列表
+// ── 音频队列 ──
+let audioQueue = [];
 let isPlaying  = false;
-let streamDone = false;  // SSE 是否已结束
-let currentReader = null; // 当前 SSE reader，用于中断
-let pendingUserMsg = null; // 用户发消息时若 AI 正在讲，先缓存，讲完再处理
-
-// 打断当前播放和 SSE 流（强制中断，用于必要时）
-function interruptCurrent() {
-  audioQueue = [];
-  isPlaying  = false;
-  streamDone = false;
-  pendingUserMsg = null;
-  bgRestore();
-  if (currentReader) {
-    currentReader.cancel();
-    currentReader = null;
-  }
-}
+let streamDone = false;
+let aiSpeakingEl = null;  // "小晴正在说话..." 提示节点
 
 // 浏览器 Autoplay 解锁
 let userInteracted = false;
@@ -513,7 +578,7 @@ let pendingPlay = null;
 function markInteracted() {
   if (userInteracted) return;
   userInteracted = true;
-  _startBgMusic();   // 用户第一次交互后启动背景音乐
+  _startBgMusic();
   if (pendingPlay) { const fn = pendingPlay; pendingPlay = null; fn(); }
 }
 document.addEventListener('click',   markInteracted, { once: false });
@@ -527,20 +592,19 @@ function enqueueAudio(url) {
 function tryPlayNext() {
   if (audioQueue.length === 0) {
     isPlaying = false;
-    bgRestore();           // 队列播完，恢复背景音量
+    bgRestore();
     if (streamDone) onAllDone();
     return;
   }
   const playFn = () => {
     isPlaying = true;
-    bgDuck();              // 开始播语音，背景压低
+    bgDuck();
     const url = audioQueue.shift() + '?t=' + Date.now();
     const a = new Audio(url);
     let advanced = false;
-    const advance = () => { if (!advanced) { advanced = true; setTimeout(tryPlayNext, 700); } };
+    const advance = () => { if (!advanced) { advanced = true; setTimeout(tryPlayNext, 600); } };
     a.addEventListener('ended', advance);
     a.addEventListener('error', advance);
-    // 保底：若 ended/error 都没触发（极少见），10s 后强制推进
     const watchdog = setTimeout(advance, 10000);
     a.addEventListener('ended', () => clearTimeout(watchdog));
     a.addEventListener('error', () => clearTimeout(watchdog));
@@ -552,92 +616,88 @@ function tryPlayNext() {
 
 // ── 冷场检测 ──
 let idleTimer = null;
-const IDLE_SEC = 10;
-let isResponding = false;  // AI 是否正在生成（用于冷场判断，不阻塞发消息）
+const IDLE_SEC = 20;
 
 function resetIdleTimer() {
   clearTimeout(idleTimer);
-  if (isResponding || isPlaying) return;
   idleTimer = setTimeout(triggerIdle, IDLE_SEC * 1000);
 }
 function onAllDone() {
-  isResponding = false;
-  sendBtn.disabled = false;
-  input.focus();
-  // 若用户在 AI 讲话期间发了消息，现在处理
-  if (pendingUserMsg) {
-    const { text } = pendingUserMsg;
-    pendingUserMsg = null;
-    _doSend(text, false);  // 气泡已在发消息时加过
-    return;
-  }
+  if (aiSpeakingEl) { aiSpeakingEl.remove(); aiSpeakingEl = null; }
   resetIdleTimer();
 }
 
 async function triggerIdle() {
-  if (isResponding || isPlaying) { resetIdleTimer(); return; }
-  isResponding = true;
-  streamDone = false;
-  await streamRequest('/stream', { username }, null);
+  if (isPlaying || audioQueue.length > 0) { resetIdleTimer(); return; }
+  await fetch('/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username })
+  });
 }
 
-// ── SSE 流式接收 ──
-async function streamRequest(url, body, statusEl) {
-  let res;
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-  } catch(e) {
-    if (statusEl) statusEl.remove();
-    onAllDone();
-    return;
-  }
-  if (!res.ok) {
-    if (statusEl) statusEl.remove();
-    addSys('❌ 请求失败');
-    onAllDone();
-    return;
-  }
-  const reader = res.body.getReader();
-  currentReader = reader;
-  const decoder = new TextDecoder();
-  let buf = '';
+// ── 广播 SSE 接收（/events 长连接）──
+function connectEvents({ onReady } = {}) {
+  const es = new EventSource('/events?username=' + encodeURIComponent(username) + '&clientId=' + clientId);
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\\n\\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data:')) continue;
-        let evt;
-        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
-        if (evt.type === 'seg') {
-          if (statusEl) { statusEl.remove(); statusEl = null; }
-          // 音频立即入队（不等气泡），气泡按段序延迟显示，制造逐句打出的真实感
-          enqueueAudio(evt.url);
-          const delay = evt.idx * 600;
-          setTimeout(() => addMsg('ai', evt.text), delay);
-        } else if (evt.type === 'done') {
-          streamDone = true;
-          if (!isPlaying && audioQueue.length === 0) onAllDone();
-        } else if (evt.type === 'error') {
-          if (statusEl) statusEl.remove();
-          addSys('❌ ' + evt.msg);
-          onAllDone();
-        }
+  es.onmessage = (e) => {
+    let evt;
+    try { evt = JSON.parse(e.data); } catch { return; }
+
+    if (evt.type === 'online') {
+      // 第一次收到 online = SSE 连接真正就绪，触发 onReady 回调（只触发一次）
+      if (onReady) { onReady(); onReady = null; }
+      const badge = document.getElementById('online-badge');
+      if (badge) badge.textContent = '● ' + evt.count + ' 人在线';
+
+    } else if (evt.type === 'user_msg') {
+      // 其他用户发言的气泡（自己的已在 sendMsg 乐观显示，跳过）
+      if (evt.username !== username) {
+        addMsg('user', evt.text, evt.username);
       }
+
+    } else if (evt.type === 'ai_speaking') {
+      if (evt.value) {
+        // 显示"小晴正在说话..."
+        if (!aiSpeakingEl) {
+          aiSpeakingEl = document.createElement('div');
+          aiSpeakingEl.className = 'msg ai-speaking';
+          aiSpeakingEl.textContent = '🎙 小晴正在说话...';
+          chatBox.appendChild(aiSpeakingEl);
+          chatBox.scrollTop = chatBox.scrollHeight;
+        }
+        streamDone = false;
+      } else {
+        // AI 说完了，若队列空直接 onAllDone
+        streamDone = true;
+        if (!isPlaying && audioQueue.length === 0) onAllDone();
+      }
+
+    } else if (evt.type === 'seg') {
+      if (aiSpeakingEl) { aiSpeakingEl.remove(); aiSpeakingEl = null; }
+      console.log('[seg]', evt.idx, evt.text, 'queue:', audioQueue.length, 'playing:', isPlaying);
+      enqueueAudio(evt.url);
+      const delay = evt.idx * 600;
+      setTimeout(() => addMsg('ai', evt.text), delay);
+
+    } else if (evt.type === 'done') {
+      streamDone = true;
+      if (!isPlaying && audioQueue.length === 0) onAllDone();
+
+    } else if (evt.type === 'error') {
+      if (aiSpeakingEl) { aiSpeakingEl.remove(); aiSpeakingEl = null; }
+      addSys('❌ ' + evt.msg);
+      onAllDone();
+
+    } else if (evt.type === 'heartbeat') {
+      // 忽略
     }
-  } catch(e) {
-    // reader 被 cancel() 打断，正常情况，不报错
-  } finally {
-    if (currentReader === reader) currentReader = null;
-  }
+  };
+
+  es.onerror = () => {
+    es.close();
+    setTimeout(connectEvents, 3000);  // 断线重连
+  };
 }
 
 // ── 发送消息 ──
@@ -648,54 +708,38 @@ async function sendMsg() {
   input.value = '';
   clearTimeout(idleTimer);
 
-  // 如果 AI 正在讲话，先缓存消息，等当前段讲完再回复
-  if (isResponding || isPlaying) {
-    pendingUserMsg = { text };
-    addMsg('user', text);
-    // 停止继续生成后续段（SSE），但不打断正在播的这段
-    if (currentReader) { currentReader.cancel(); currentReader = null; }
-    streamDone = true;
-    // 若此刻既不在播放、队列也空，需要手动触发 onAllDone 避免死锁
-    if (!isPlaying && audioQueue.length === 0) {
-      setTimeout(onAllDone, 50);
-    }
-    return;
-  }
+  // 乐观渲染自己的气泡（不等广播回来）
+  addMsg('user', text, username);
 
-  _doSend(text);
-}
-
-async function _doSend(text, showUserMsg = true) {
-  isResponding = true;
-  streamDone   = false;
-  sendBtn.disabled = true;
-
-  if (showUserMsg) addMsg('user', text);
-  const status = addSys('小晴思考中...');
-  await streamRequest('/stream', { text, username }, status);
+  await fetch('/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, username })
+  });
 }
 
 // ── 进入直播间 ──
-async function onEnter() {
-  isResponding = true;
-  streamDone   = false;
-  audioQueue   = [];
-  clearTimeout(idleTimer);
-  try {
-    await streamRequest('/stream', { enter: true, username }, null);
-  } catch(e) {
-    onAllDone();
-  }
-}
-
-function enterRoom() {
+async function enterRoom() {
   const overlay = document.getElementById('enter-overlay');
   overlay.style.display = 'none';
-  markInteracted();   // 用户点击 = 交互解锁，autoplay 可用
-  onEnter();
+  markInteracted();
+
+  // 先建立广播连接，等收到第一个 online 事件（SSE 连接真正就绪）再发欢迎请求
+  // 避免欢迎语广播时 /events 还没建立而丢失
+  connectEvents({ onReady: () => {
+    fetch('/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enter: true, username })
+    });
+    resetIdleTimer();
+  }});
 }
 
-// 不再自动触发，等用户点"进入直播间"
+// 页面关闭/刷新时主动通知后端注销该 tab 的连接
+window.addEventListener('beforeunload', () => {
+  navigator.sendBeacon('/leave', JSON.stringify({ clientId }));
+});
 </script>
 </body>
 </html>
@@ -709,44 +753,33 @@ def index():
     return render_template_string(HTML)
 
 
-@app.route("/stream", methods=["POST"])
-def stream():
-    """统一 SSE 流式接口：chat / enter / idle 都走这里。"""
-    data     = request.get_json() or {}
-    username = data.get("username", "宝贝").strip() or "宝贝"
-    text     = data.get("text", "").strip()
-    is_enter = data.get("enter", False)
+@app.route("/events")
+def events():
+    """SSE 长连接：每个用户进入直播间后持有，接收广播消息。"""
+    uname     = request.args.get("username",  "宝贝").strip() or "宝贝"
+    client_id = request.args.get("clientId",  "").strip() or uuid.uuid4().hex[:12]
+    c = _register_client(client_id, uname)
 
-    if is_enter:
-        logger.info(f"[进入直播间] user={username}")
-        prompt   = (
-            f"[系统通知]：用户「{username}」刚刚进入了直播间。"
-            "请像真实直播主播一样欢迎他，说3行，每行一句，换行分隔。"
-            "第一行：欢迎他进入直播间，可以用『欢迎欢迎』『哎呀来啦』『诶～来了』等开场，带他的名字；"
-            "第二行：一句暖场的话，比如夸他、问他哪里来的、说今天等他好久了之类；"
-            "第三行：邀请他留下来聊，说法要自然撩人，不要太正式；"
-            "语气热情、口语、有点黏，不要像机器人报幕，不要用感叹号，不要书面语。"
-            "每行可以在中间插一个语气标签（[uv_break]或[laugh_0]），但不能放在行末。"
-        )
-        log_role = "system"
-        _log("system", username, "进入直播间")
-    elif text:
-        logger.info(f"[用户发言] user={username} | {text!r}")
-        _inc_user_turns(username)
-        relation = _get_relation(username)
-        prompt   = f"[当前关系阶段：{relation}]\n[{username}说]：{text}"
-        log_role = "user"
-        _log("user", username, text)
-    else:
-        logger.info(f"[冷场触发] user={username}")
-        prompt   = _next_idle_prompt(username)
-        log_role = "system"
-        _log("system", username, "[冷场触发]")
+    # 通知所有人刷新在线人数
+    broadcast({"type": "online", "count": online_count()})
 
-    session_id = uuid.uuid4().hex[:8]
+    def generate():
+        try:
+            while True:
+                try:
+                    msg = c.q.get(timeout=20)
+                except queue.Empty:
+                    msg = _sse({"type": "heartbeat"})
+                try:
+                    yield msg
+                except Exception:
+                    break
+        finally:
+            _unregister_client(client_id)
+            broadcast({"type": "online", "count": online_count()})
 
     return Response(
-        stream_with_context(_stream_response(prompt, session_id, username, log_role)),
+        stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -755,9 +788,66 @@ def stream():
     )
 
 
+@app.route("/stream", methods=["POST"])
+def stream():
+    """接收用户消息，入队 _reply_queue，立即返回 204。"""
+    data     = request.get_json() or {}
+    uname    = data.get("username", "宝贝").strip() or "宝贝"
+    text     = data.get("text", "").strip()
+    is_enter = data.get("enter", False)
+
+    if is_enter:
+        logger.info(f"[进入直播间] user={uname}")
+        prompt = (
+            f"[系统通知]：用户「{uname}」刚刚进入了直播间。"
+            "请像真实直播主播一样欢迎他，说3行，每行一句，换行分隔。"
+            "第一行：欢迎他进入直播间，可以用『欢迎欢迎』『哎呀来啦』『诶～来了』等开场，带他的名字；"
+            "第二行：一句暖场的话，比如夸他、问他哪里来的、说今天等他好久了之类；"
+            "第三行：邀请他留下来聊，说法要自然撩人，不要太正式；"
+            "语气热情、口语、有点黏，不要像机器人报幕，不要用感叹号，不要书面语。"
+            "每行可以在中间插一个语气标签（[uv_break]或[laugh_0]），但不能放在行末。"
+        )
+        _log("system", uname, "进入直播间")
+        _reply_queue.put({"username": uname, "prompt": prompt, "log_role": "system", "display_text": None})
+
+    elif text:
+        logger.info(f"[用户发言] user={uname} | {text!r}")
+        _inc_user_turns(uname)
+        relation = _get_relation(uname)
+        prompt   = f"[当前关系阶段：{relation}]\n[{uname}说]：{text}"
+        _log("user", uname, text)
+        # 立即广播用户气泡，不等 worker（所有在线用户实时看到弹幕）
+        broadcast({"type": "user_msg", "username": uname, "text": text})
+        _reply_queue.put({"username": uname, "prompt": prompt, "log_role": "user", "display_text": None})
+
+    else:
+        # 冷场触发（idle，前端只传 username）
+        logger.info(f"[冷场触发] user={uname}")
+        prompt = _next_idle_prompt(uname)
+        _log("system", uname, "[冷场触发]")
+        _reply_queue.put({"username": uname, "prompt": prompt, "log_role": "system", "display_text": None})
+
+    return "", 204
+
+
+@app.route("/leave", methods=["POST"])
+def leave():
+    """前端页面关闭/刷新时主动调用，精确注销该 tab 的连接。"""
+    # sendBeacon 发的是 text/plain，需要手动解析
+    try:
+        raw = request.get_data(as_text=True)
+        data = json.loads(raw)
+    except Exception:
+        data = {}
+    client_id = data.get("clientId", "").strip()
+    if client_id:
+        _unregister_client(client_id)
+        broadcast({"type": "online", "count": online_count()})
+    return "", 204
+
+
 @app.route("/audio_cache/<filename>")
 def audio_cache(filename):
-    # 简单校验，防路径穿越
     if "/" in filename or ".." in filename:
         return "Bad request", 400
     path = os.path.join(_AUDIO_DIR, filename)
@@ -779,7 +869,6 @@ def tts_test_page():
 
 @app.route("/tts_test/synth", methods=["POST"])
 def tts_test_synth():
-    """合成测试文本，返回音频 URL。"""
     data = request.get_json() or {}
     text = data.get("text", "").strip()
     if not text:
@@ -904,69 +993,31 @@ function buildCases() {
       const key = id + '_' + i;
       const div = document.createElement('div');
       div.className = 'case';
-
-      const labelEl = document.createElement('span');
-      labelEl.className = 'case-label';
-      labelEl.textContent = label;
-
-      const textEl = document.createElement('span');
-      textEl.className = 'case-text';
-      textEl.textContent = text;
-
-      const rightEl = document.createElement('div');
-      rightEl.className = 'case-right';
-
-      const btn = document.createElement('button');
-      btn.className = 'play-btn';
-      btn.textContent = '▶ 播放';
-
-      const statusEl = document.createElement('span');
-      statusEl.className = 'status';
-
-      const fbInput = document.createElement('input');
-      fbInput.className = 'feedback-input';
-      fbInput.placeholder = '填反馈...';
-      fbInput.addEventListener('input', () => {
-        feedbacks[key] = {label, text, fb: fbInput.value};
-      });
-
-      const audioEl = document.createElement('audio');
-      audioEl.style.display = 'none';
-
+      const labelEl = document.createElement('span'); labelEl.className = 'case-label'; labelEl.textContent = label;
+      const textEl  = document.createElement('span'); textEl.className  = 'case-text';  textEl.textContent  = text;
+      const rightEl = document.createElement('div');  rightEl.className = 'case-right';
+      const btn     = document.createElement('button'); btn.className = 'play-btn'; btn.textContent = '▶ 播放';
+      const statusEl = document.createElement('span'); statusEl.className = 'status';
+      const fbInput  = document.createElement('input'); fbInput.className = 'feedback-input'; fbInput.placeholder = '填反馈...';
+      fbInput.addEventListener('input', () => { feedbacks[key] = {label, text, fb: fbInput.value}; });
+      const audioEl = document.createElement('audio'); audioEl.style.display = 'none';
       btn.addEventListener('click', () => synthAndPlay(btn, text, statusEl, audioEl));
-
-      rightEl.appendChild(btn);
-      rightEl.appendChild(statusEl);
-      rightEl.appendChild(fbInput);
-      div.appendChild(labelEl);
-      div.appendChild(textEl);
-      div.appendChild(rightEl);
-      div.appendChild(audioEl);
+      rightEl.appendChild(btn); rightEl.appendChild(statusEl); rightEl.appendChild(fbInput);
+      div.appendChild(labelEl); div.appendChild(textEl); div.appendChild(rightEl); div.appendChild(audioEl);
       container.appendChild(div);
     });
   }
 }
 
 async function synthAndPlay(btn, text, statusEl, audioEl) {
-  btn.disabled = true;
-  statusEl.textContent = '合成中...';
+  btn.disabled = true; statusEl.textContent = '合成中...';
   try {
-    const r = await fetch('/tts_test/synth', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text})
-    });
+    const r = await fetch('/tts_test/synth', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}) });
     const data = await r.json();
     if (data.error) { statusEl.textContent = 'ERR'; btn.disabled = false; return; }
-    audioEl.src = data.url + '?t=' + Date.now();
-    audioEl.style.display = 'inline';
-    audioEl.play();
-    statusEl.textContent = '▶';
-    audioEl.onended = () => { statusEl.textContent = 'OK'; };
-  } catch(e) {
-    statusEl.textContent = 'ERR';
-    console.error(e);
-  }
+    audioEl.src = data.url + '?t=' + Date.now(); audioEl.style.display = 'inline'; audioEl.play();
+    statusEl.textContent = '▶'; audioEl.onended = () => { statusEl.textContent = 'OK'; };
+  } catch(e) { statusEl.textContent = 'ERR'; }
   btn.disabled = false;
 }
 
@@ -977,17 +1028,12 @@ document.getElementById('custom-btn').addEventListener('click', async () => {
   const cleanedEl = document.getElementById('custom-cleaned');
   statusEl.textContent = '合成中...';
   try {
-    const r = await fetch('/tts_test/synth', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text})
-    });
+    const r = await fetch('/tts_test/synth', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}) });
     const data = await r.json();
     if (data.error) { statusEl.textContent = 'ERR'; return; }
     cleanedEl.textContent = '送入TTS: ' + data.cleaned;
     statusEl.textContent = '▶';
-    const a = new Audio(data.url + '?t=' + Date.now());
-    a.play();
+    const a = new Audio(data.url + '?t=' + Date.now()); a.play();
     a.onended = () => { statusEl.textContent = 'OK'; };
   } catch(e) { statusEl.textContent = 'ERR'; }
 });
@@ -995,17 +1041,13 @@ document.getElementById('custom-btn').addEventListener('click', async () => {
 function genSummary() {
   const lines = ['=== ChatTTS 标签测试反馈 ==='];
   for (const [key, {label, text, fb}] of Object.entries(feedbacks)) {
-    if (fb) lines.push('[' + label + '] ' + text + '\n  反馈: ' + fb);
+    if (fb) lines.push('[' + label + '] ' + text + '\\n  反馈: ' + fb);
   }
   if (lines.length === 1) lines.push('（还没填写任何反馈）');
-  document.getElementById('feedback-summary').value = lines.join('\n');
+  document.getElementById('feedback-summary').value = lines.join('\\n');
 }
-
 function copySummary() {
-  const el = document.getElementById('feedback-summary');
-  el.select();
-  document.execCommand('copy');
-  alert('已复制到剪贴板');
+  const el = document.getElementById('feedback-summary'); el.select(); document.execCommand('copy'); alert('已复制到剪贴板');
 }
 
 buildCases();
@@ -1042,5 +1084,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5401"))
     print(f"\n✅ 在浏览器访问：http://<服务器IP>:{port}\n")
     print(f"🔬 TTS标签测试页：http://<服务器IP>:{port}/tts_test\n")
-    # threaded=True 支持 SSE 长连接 + 并发请求
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
