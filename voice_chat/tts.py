@@ -14,7 +14,7 @@ import numpy as np
 
 # ─────────────────────────── 配置 ───────────────────────────
 # 音色种子（固定种子 = 固定音色，设为 None 则随机）
-SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "4000"))
+SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "9000"))
 
 # 推理参数
 TEMPERATURE   = float(os.getenv("CHATTTS_TEMPERATURE",   "0.3"))
@@ -43,7 +43,10 @@ class TTSEngine:
             # ChatTTS 会在该目录下查找 asset/ 子目录，
             # 避免从不同工作目录启动时重复下载模型
             _base_dir = os.path.dirname(os.path.abspath(__file__))
-            self.chat.load(source="local", custom_path=_base_dir, compile=False)
+            import torch
+            _device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[TTS] 使用设备: {_device}")
+            self.chat.load(source="local", custom_path=_base_dir, compile=False, device=_device)
             print("[TTS] ChatTTS 加载完成。")
         except ImportError:
             raise ImportError(

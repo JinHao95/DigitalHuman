@@ -14,7 +14,7 @@ LLM_MODEL       = os.getenv("LLM_MODEL", "gpt-4o-mini")
 # 系统提示：简短友善，适合口语对话，支持 ChatTTS 韵律标签
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "你是一个性感、活泼的女性语音助手。请用自然口语风格回答，回答尽量简短，控制在 100 字以内。"
+    "你是一个性感、活泼的女性语音助手。请用自然口语风格回答，回答尽量简短，控制在 60 字以内。"
     "回复中可以适当插入以下 ChatTTS 韵律标签来增加表现力："
     "[uv_break] 表示短停顿，[lbreak] 表示长停顿，[laugh] 表示笑声，[oral_5] 表示口语化语气。"
     "禁止使用 Markdown、列表、星号、井号等格式符号。",
@@ -65,7 +65,7 @@ class LLMClient:
                 model=self.model,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=300,
+                max_tokens=200,
             )
             reply = resp.choices[0].message.content.strip()
             self._append_assistant(reply)
@@ -94,7 +94,7 @@ class LLMClient:
                 model=self.model,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=300,
+                max_tokens=200,
                 stream=True,
             )
             for chunk in stream:
